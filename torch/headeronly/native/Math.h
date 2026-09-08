@@ -194,11 +194,21 @@ inline typename std::enable_if_t<std::is_floating_point_v<T>, T> calc_erfinv(
         -std::log((static_cast<T>(1.0) - y_abs) / static_cast<T>(2.0)));
     num = ((c[3] * z + c[2]) * z + c[1]) * z + c[0];
     dem = (d[1] * z + d[0]) * z + static_cast<T>(1.0);
+    x = num / dem;
+    // Use erfc in the tail to avoid cancellation in erf(x) - y.
+    x += (std::erfc(x) - (static_cast<T>(1.0) - y_abs)) /
+        ((static_cast<T>(2.0) * frac_1_sqrt_pi<T>)*std::exp(-x * x));
+    x += (std::erfc(x) - (static_cast<T>(1.0) - y_abs)) /
+        ((static_cast<T>(2.0) * frac_1_sqrt_pi<T>)*std::exp(-x * x));
+    if constexpr (std::is_same_v<T, double>) {
+      x += (std::erfc(x) - (static_cast<T>(1.0) - y_abs)) /
+          ((static_cast<T>(2.0) * frac_1_sqrt_pi<T>)*std::exp(-x * x));
+    }
 #ifdef _WIN32
     // error C2039: '_copysign': is not a member of 'std'
-    x = copysign(num, y) / dem;
+    return copysign(x, y);
 #else
-    x = std::copysign(num, y) / dem;
+    return std::copysign(x, y);
 #endif
   }
   /* Two steps of Newton-Raphson correction */
@@ -299,7 +309,7 @@ inline double calc_digamma(double x) {
     // error (when |x| > 1).
     double q, r;
     r = std::modf(x, &q);
-    return calc_digamma(1 - x) - pi<double> / tan(pi<double> * r);
+    return calc_digamma(1 - x) - pi<double> / std::tan(pi<double> * r);
   }
 
   // Push x to be >= 10
@@ -328,7 +338,7 @@ inline double calc_digamma(double x) {
     double z = 1.0 / (x * x);
     y = z * polevl(z, A, 6);
   }
-  return result + log(x) - (0.5 / x) - y;
+  return result + std::log(x) - (0.5 / x) - y;
 }
 
 /*
@@ -359,7 +369,7 @@ inline float calc_digamma(float x) {
     // error (when |x| > 1).
     double q, r;
     r = std::modf(x, &q);
-    float pi_over_tan_pi_x = (float)(pi<double> / tan(pi<double> * r));
+    float pi_over_tan_pi_x = (float)(pi<double> / std::tan(pi<double> * r));
     return calc_digamma(1 - x) - pi_over_tan_pi_x;
   }
 
