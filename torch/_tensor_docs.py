@@ -5238,6 +5238,10 @@ Here are the ways to call ``to``:
     :math:`2^{{-127}}` become :math:`2^{{-127}}`, and ties of
     ``"to_nearest_even"`` round up.
 
+    The results are the same on CPU and CUDA, except that NaN may be encoded
+    differently (e.g. without its sign). NaN can also differ between
+    ``round="to_nearest_even"`` and a conversion without :attr:`round`.
+
     A device change, if any, is a separate transfer, and the result is never
     ``self``. Like a plain dtype conversion, its gradient is the identity (cast
     back to the original dtype), unlike that of :func:`torch.round`, which is
