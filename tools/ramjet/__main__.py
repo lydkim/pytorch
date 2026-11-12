@@ -1,8 +1,8 @@
-"""Build this worktree on Modal and run a command on a runner you size, or list the
-tests under a path that containers of that size can run:
+"""Build this worktree on Modal and run a command on a runner you size, or run the
+tests under a path on as many containers of that size as Modal gives you:
 
     python -m tools.ramjet [OPTIONS] -- COMMAND [ARGS...]
-    python -m tools.ramjet [OPTIONS] test --list PATH... [-- PYTEST_ARGS...]
+    python -m tools.ramjet [OPTIONS] test [--list] PATH... [-- PYTEST_ARGS...]
 
 As in modal shell, --gpu, such as H100 or B200:8, --cpu and --memory size the runner;
 without --gpu it has no GPU. A 64-core builder keeps an incremental build of your
@@ -24,7 +24,7 @@ from tools.ramjet.logger import LEVEL_NAMES, log, setup_logger
 
 
 PROG = "python -m tools.ramjet"
-TEST_USAGE = f"{PROG} [OPTIONS] test --list PATH... [-- PYTEST_ARGS...]"
+TEST_USAGE = f"{PROG} [OPTIONS] test [--list] PATH... [-- PYTEST_ARGS...]"
 
 
 def parse_args(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
@@ -79,17 +79,18 @@ def parse_args(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
     test_parser = commands.add_parser(
         "test",
         usage=TEST_USAGE,
-        help="list the tests under each PATH that containers of this size can run",
+        help="run the tests under each PATH that containers of this size can run",
         description="Collect each test file under the PATHs in a container sized by "
         "--gpu, --cpu and --memory, which leaves out the tests whose tci constraints "
-        "it doesn't meet, and plan the pieces, of about 150 s by CI's times, that "
-        "containers would run. PYTEST_ARGS go to the collection, so -- -k linear lists "
-        "fewer tests.",
+        "it doesn't meet. Cut the rest into pieces of about 150 s by CI's times, and "
+        "run each piece through run_test.py in a container of its own. Each test that "
+        "fails is a line of JSON on stdout, and the exit code is 1 if any does. "
+        "PYTEST_ARGS go to the collection and to every test file, so -- -k linear "
+        "runs fewer tests.",
     )
     test_parser.add_argument(
         "--list",
         action="store_true",
-        required=True,  # until test can run them
         help="print each test and its piece as a line of JSON on stdout, and run nothing",
     )
     test_parser.add_argument(
@@ -133,6 +134,9 @@ def image_for(
         # CI publishes its images for main's .ci/docker, not for your edits to it
         start = build.toolchain(since, ci_image, python)
     else:
+        # In use: cleaners of /tmp delete files by when they were last written
+        state.touch()
+        inputs.touch()
         changes = sync.diff(last.commit, commit)
         build_inputs = frozenset(inputs.read_text().splitlines())
         used, due = lineage.read_by_build(changes, build_inputs), lineage.due(last, now)
@@ -190,7 +194,9 @@ def main() -> int:
         commit = sync.snapshot_tree()
         image = image_for(app, commit, ramjet_dir, cuda, options.python_version, config)
     if testing:
-        return test.list_tests(image, commit, resources, names, arguments, ramjet_dir)
+        rate = run.hourly_rate(resources, rates, kind="")
+        work = (image, commit, resources, names, arguments, ramjet_dir)
+        return test.run_tests(*work, options.list, rate)
     # The warm runner of this size
     gpu, cpu, memory = resources
     saved = ramjet_dir / f"runner-{gpu or 'no-gpu'}-{cpu}-{memory}.json"

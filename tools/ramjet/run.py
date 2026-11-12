@@ -128,11 +128,13 @@ def check_archs(gpu: str | None, archs: str) -> None:
         sys.exit(1)
 
 
-def hourly_rate(resources: Resources, rates: Mapping[str, Decimal]) -> Decimal:
-    """What the runner bills per hour while idle: its GPUs plus the CPU and memory
-    it requested."""
-    rate = resources.cpu * rates["cpu_hour_cost_sandbox"]
-    rate += Decimal(resources.memory) / 1024 * rates["mem_gib_hour_cost_sandbox"]
+def hourly_rate(
+    resources: Resources, rates: Mapping[str, Decimal], kind: str = "_sandbox"
+) -> Decimal:
+    """What a runner bills per hour while idle: its GPUs plus the CPU and memory it
+    requested. One of test's containers bills them at a Function's rates, kind ""."""
+    rate = resources.cpu * rates[f"cpu_hour_cost{kind}"]
+    rate += Decimal(resources.memory) / 1024 * rates[f"mem_gib_hour_cost{kind}"]
     if resources.gpu is not None:
         gpu = GPUS[gpu_name(resources.gpu)]
         name = f"gpu_hour_cost_{gpu.rate_name}"

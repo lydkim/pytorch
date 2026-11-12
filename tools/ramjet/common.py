@@ -14,6 +14,10 @@ from pathlib import Path
 from tools.ramjet.logger import log
 
 
+def count(n: int, noun: str) -> str:
+    return f"{n:,} {noun}{'' if n == 1 else 's'}"
+
+
 def git(*args: str, env: dict[str, str] | None = None, stdin: str = "") -> str:
     run = {"capture_output": True, "text": True, "env": env, "input": stdin}
     result = subprocess.run(["git", *args], **run)
