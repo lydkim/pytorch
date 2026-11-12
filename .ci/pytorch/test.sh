@@ -2472,14 +2472,39 @@ test_vec256() {
   # This is to test vec256 instructions DEFAULT/AVX/AVX2 (platform dependent, some platforms might not support AVX/AVX2)
   if [[ "$BUILD_ENVIRONMENT" != *rocm* ]]; then
     echo "Testing vec256 instructions"
-    mkdir -p test/test-reports/vec256
+    TEST_REPORTS_DIR=$(pwd)/test/test-reports/vec256
+    mkdir -p "$TEST_REPORTS_DIR"
     pushd build/bin
-    vec256_tests=$(find . -maxdepth 1 -executable -name 'vec256_test*')
+    vec256_tests=$(find . -maxdepth 1 -executable -name 'vec_test_all_types_*')
+    cpu_capability=$(python -c "import torch; print(torch.backends.cpu.get_cpu_capability())")
+    ran=0
     for vec256_exec in $vec256_tests
     do
-      $vec256_exec --gtest_output=xml:test/test-reports/vec256/"$vec256_exec".xml
+      case "$vec256_exec" in
+        *AVX512*) flags="avx512f avx512bw avx512vl avx512dq" ;;
+        *AVX2*) flags="avx2 fma f16c" ;;
+        *) flags="" ;;
+      esac
+      skip=""
+      # SVE builds assume a vector length, so only run the one in use.
+      if [[ "$vec256_exec" == *SVE* && "$vec256_exec" != *"$cpu_capability" ]]; then
+        skip="PyTorch uses $cpu_capability"
+      fi
+      for flag in $flags; do
+        grep -qw "$flag" /proc/cpuinfo || skip="the CPU lacks $flag"
+      done
+      if [[ -n "$skip" ]]; then
+        echo "Skipping $vec256_exec: $skip"
+        continue
+      fi
+      $vec256_exec --gtest_output=xml:"$TEST_REPORTS_DIR/${vec256_exec#./}.xml"
+      ran=$((ran + 1))
     done
     popd
+    if [[ "$ran" == 0 ]]; then
+      echo "No vec_test_all_types binary ran"
+      exit 1
+    fi
     assert_git_not_dirty
   fi
 }
@@ -2889,6 +2914,7 @@ elif [[ "${SHARD_NUMBER}" == 1 && $NUM_TEST_SHARDS -gt 1 ]]; then
   install_torchvision
   test_python_shard 1
   test_aten
+  test_vec256
   test_libtorch 1
   if [[ "${BUILD_ENVIRONMENT}" == *xpu* ]]; then
     test_xpu_bin
