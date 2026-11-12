@@ -12,7 +12,7 @@ import torch
 import torch.fx.node
 from torch._C._dynamo.guards import compute_overlapping_tensors
 from torch._dispatch.python import enable_python_dispatcher
-from torch._dynamo.utils import ReinplaceCounters, ReInplaceTrigger
+from torch._dynamo.utils import counters, ReinplaceCounters, ReInplaceTrigger
 from torch._guards import detect_fake_mode
 from torch._higher_order_ops.user_kernel_hop import (
     get_user_kernel_hop_info,
@@ -240,6 +240,20 @@ def should_reinplace_index_put(node: torch.fx.Node) -> bool:
     )
 
 
+def _is_auto_functionalized_output(node: object) -> bool:
+    """True if node is an output of auto_functionalized(_v2), through getitems/views."""
+    hop = torch.ops.higher_order
+    cur = node
+    while isinstance(cur, torch.fx.Node):
+        if cur.target in (hop.auto_functionalized, hop.auto_functionalized_v2):
+            return True
+        is_view = cur.target is operator.getitem or _is_view_op(cur.target)
+        if not (is_view and cur.args):
+            return False
+        cur = cur.args[0]  # type: ignore[assignment]
+    return False
+
+
 def should_reinplace_scatter(node: torch.fx.Node) -> bool:
     """Choose between mutating and functional scatter decompositions
 
@@ -263,6 +277,14 @@ def should_reinplace_scatter(node: torch.fx.Node) -> bool:
         return True
 
     if is_node_realized(inp) and is_node_realized(node):  # type: ignore[arg-type]
+        return True
+
+    # is_node_realized() misses outputs of auto_functionalized(_v2), but a custom
+    # op with mutates_args always writes into a realized buffer, so a functional
+    # scatter would copy that whole buffer to update one region.
+    if is_node_realized(node) and _is_auto_functionalized_output(inp):
+        counters["inductor"]["reinplace_mutated_base_scatter"] += 1
+        log.debug("reinplacing scatter %s into a custom op's mutated output", node)
         return True
 
     # If the output is copied back into the input, this forces both to be

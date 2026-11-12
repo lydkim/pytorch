@@ -6,13 +6,16 @@ import torch
 import torch._inductor.config as inductor_config
 from functorch import make_fx
 from torch import Tensor
-from torch._dynamo.utils import ReinplaceCounters
+from torch._dynamo.utils import counters, ReinplaceCounters
 from torch._higher_order_ops.auto_functionalize import (
     auto_functionalized,
     auto_functionalized_v2,
 )
 from torch._inductor import inductor_prims
-from torch._inductor.fx_passes.reinplace import reinplace_inplaceable_ops_core
+from torch._inductor.fx_passes.reinplace import (
+    _is_auto_functionalized_output,
+    reinplace_inplaceable_ops_core,
+)
 from torch._inductor.test_case import run_tests, TestCase as InductorTestCase
 from torch.testing._internal.common_utils import (
     instantiate_parametrized_tests,
@@ -48,6 +51,27 @@ def sin(x: torch.Tensor, result: torch.Tensor) -> None:
 def sin_cos(x: torch.Tensor, out_sin: torch.Tensor, out_cos: torch.Tensor) -> None:
     out_sin.copy_(x.sin())
     out_cos.copy_(x.cos())
+
+
+@torch.library.custom_op("_reinplacing::write3_views", mutates_args={"b", "c", "d"})
+def write3_views(x: Tensor, b: Tensor, c: Tensor, d: Tensor) -> None:
+    b.copy_(x)
+    c.copy_(x + 1)
+    d.copy_(x + 2)
+
+
+@write3_views.register_fake
+def _(x, b, c, d) -> None:
+    return None
+
+
+def mutated_base_scatter(x, weight):
+    w = x.shape[1]
+    buf = torch.empty((x.shape[0], 4 * w), dtype=x.dtype, device=x.device)
+    a, b, c, d = [buf[:, i * w : (i + 1) * w] for i in range(4)]
+    write3_views(x, b, c, d)
+    a.copy_(x * 0.5)
+    return buf @ weight
 
 
 if HAS_GPU:
@@ -290,6 +314,98 @@ class TestReinplacingPassCorrectness(InductorTestCase):
         actual = gm(input_pos, val, actual_cache)
         self.assertEqual(actual, expected)
         self.assertEqual(actual_cache, expected_cache)
+
+    @staticmethod
+    def _counter_delta(name, before):
+        return counters["inductor"][name] - before
+
+    def test_reinplace_mutated_base_scatter(self):
+        # A custom op writes three disjoint views of a fresh buffer, a separate
+        # write fills the fourth, and a GEMM consumes the whole buffer. The head
+        # write must become an in-place copy_ into the custom op's output, not a
+        # functional slice_scatter that copies the whole buffer.
+        x = torch.randn(16, 8, device=device)
+        weight = torch.randn(32, 8, device=device)
+        before = counters["inductor"]["reinplace_mutated_base_scatter"]
+        log_stream, ctx = logs_to_string(
+            "torch._inductor.compile_fx", "post_grad_graphs"
+        )
+        with ctx():
+            torch._dynamo.reset()
+            actual = torch.compile(mutated_base_scatter)(x, weight)
+        self.assertEqual(actual, mutated_base_scatter(x, weight))
+        self.assertEqual(log_stream.getvalue().count("aten.slice_scatter"), 0)
+        self.assertGreater(
+            self._counter_delta("reinplace_mutated_base_scatter", before), 0
+        )
+
+    @parametrize("v2", [False, True])
+    def test_is_auto_functionalized_output(self, v2):
+        def f(x):
+            out = torch.empty_like(x)
+            if v2:
+                _, new_out = auto_functionalized_v2(
+                    sin._opoverload,
+                    x=x,
+                    _result_base_index=0,
+                    _result_size=(3,),
+                    _result_stride=(1,),
+                    _result_storage_offset=0,
+                    _all_bases=[out],
+                )
+            else:
+                _, new_out = auto_functionalized(sin._opoverload, x=x, result=out)
+            return new_out * 2
+
+        gm = make_fx(f, tracing_mode="fake")(torch.randn(3))
+        hop = torch.ops.higher_order
+        target = hop.auto_functionalized_v2 if v2 else hop.auto_functionalized
+        (af,) = [n for n in gm.graph.nodes if n.target is target]
+        self.assertTrue(any(_is_auto_functionalized_output(u) for u in af.users))
+        # Neither the fresh buffer nor a consumer of the result is an output.
+        (empty,) = [n for n in gm.graph.nodes if n.target is aten.empty_like.default]
+        (mul,) = [n for n in gm.graph.nodes if n.target is aten.mul.Tensor]
+        self.assertFalse(_is_auto_functionalized_output(empty))
+        self.assertFalse(_is_auto_functionalized_output(mul))
+
+    def test_training_grad_through_mutating_custom_op(self):
+        # The same pattern in a custom backward: the reinplace fires and the
+        # gradients are bit-identical to eager.
+        w = 8
+
+        class Ragged(torch.autograd.Function):
+            @staticmethod
+            def forward(ctx, q):
+                ctx.ww = q.shape[1]
+                return q * 2
+
+            @staticmethod
+            def backward(ctx, grad):
+                ww = ctx.ww
+                weight = (
+                    torch.arange(
+                        4 * ww * ww, dtype=grad.dtype, device=grad.device
+                    ).reshape(4 * ww, ww)
+                    * 0.01
+                )
+                return mutated_base_scatter(grad, weight)
+
+        def step(q):
+            return Ragged.apply(q).sum()
+
+        seed = torch.randn(16, w)
+        q_ref = seed.clone().detach().requires_grad_(True)
+        step(q_ref).backward()
+        ref = q_ref.grad.clone()
+
+        before = counters["inductor"]["reinplace_mutated_base_scatter"]
+        torch._dynamo.reset()
+        q = seed.clone().detach().requires_grad_(True)
+        torch.compile(step)(q).backward()
+        self.assertEqual(q.grad, ref, atol=0, rtol=0)
+        self.assertGreater(
+            self._counter_delta("reinplace_mutated_base_scatter", before), 0
+        )
 
     def test_counters_functionalize_old(self):
         ReinplaceCounters.clear()
